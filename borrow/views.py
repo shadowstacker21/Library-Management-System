@@ -1,49 +1,63 @@
 from django.shortcuts import render
-from borrow.serializers import BorrowSerializer
-from borrow.models import Borrow
+from borrow.serializers import BorrowSerializer,ReturnSerializer
+from borrow.models import Borrow,Return
 from rest_framework.viewsets import ModelViewSet
-from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework import status
 from books.models import Book
-from members.models import Member
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
+from django.db import transaction
+from rest_framework.permissions import IsAdminUser,IsAuthenticated
+from rest_framework.exceptions import ValidationError
 
-class BorrowViewSet(ModelViewSet):
-    queryset = Borrow.objects.all()
+class BorrowView(ModelViewSet):
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
     serializer_class = BorrowSerializer
-   
+    queryset = Borrow.objects.select_related('book').select_related('member').all()
 
-    @action(detail=False, methods=['post'], url_path='borrow')
-    def borrow_book(self, request, book_pk=None):
-        member_id = request.data.get('member_id')
-        try:
-            book = Book.objects.get(id=book_pk)
+    def get_permissions(self):
+        if self.request.method.upper() in ['GET', 'POST']:
+            return [IsAuthenticated()]
+        return [IsAdminUser()]
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        book=serializer.validated_data['book']
+        with transaction.atomic():
+            book = Book.objects.select_for_update().get(id=book.id)
             if not book.availabilty:
-                return Response({'error': 'Book not available'}, status=status.HTTP_400_BAD_REQUEST)
-            member = Member.objects.get(id=member_id)
-
-            borrow = Borrow.objects.create(book=book, member=member)
+                raise ValidationError("This book is currently unavailable.")
+            if Borrow.objects.filter(book=book,member=user).exists():
+                raise ValidationError("You have already borrowed this book.")
+        
             book.availabilty = False
             book.save()
+            serializer.save(member=user)
 
-            return Response(self.get_serializer(borrow).data, status=status.HTTP_201_CREATED)
-        except Book.DoesNotExist:
-            return Response({'error': 'Book not found'}, status=status.HTTP_404_NOT_FOUND)
-        except Member.DoesNotExist:
-            return Response({'error': 'Member not found'}, status=status.HTTP_404_NOT_FOUND)
+class ReturnView(ModelViewSet):
+    http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
+    serializer_class = ReturnSerializer
+    queryset = Return.objects.select_related('book').select_related('member').all()
+    
 
-    @action(detail=True, methods=['post'], url_path='return')
-    def return_book(self, request, pk=None):
-        borrow = get_object_or_404(Borrow, pk=pk)
-        if borrow.return_date:
-            return Response({'error': 'Book already returned'}, status=status.HTTP_400_BAD_REQUEST)
+    def get_permissions(self):
+        if self.request.method.upper() in ['GET', 'POST']:
+            return [IsAuthenticated()]
+        return [IsAdminUser()]
+    
+    def perform_create(self, serializer):
+        user = self.request.user
+        book = serializer.validated_data['book']
 
-        borrow.return_date = timezone.now()
-        borrow.save()
+        with transaction.atomic():
+            borrow = Borrow.objects.filter(book=book, member=user).first()
+            if not borrow:
+                raise ValidationError("You did not borrow this book.")
+            
+            if Return.objects.filter(book=book, member=user).exists():
+                raise ValidationError("You have already returned this book.")
 
-        borrow.book.availabilty = True
-        borrow.book.save()
-
-        return Response({'message': 'Book returned successfully'}, status=status.HTTP_200_OK)
+            book.availabilty = True
+            book.save()
+            serializer.save(member=user)
